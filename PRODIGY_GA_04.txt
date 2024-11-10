@@ -1,0 +1,123 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torchvision import transforms, datasets
+from torch.utils.data import DataLoader
+from torchvision.utils import save_image
+
+class Generator(nn.Module):
+    def __init__(self, input_channels=3, output_channels=3, features=64):
+        super(Generator, self).__init__()
+        self.encoder = nn.Sequential(
+            self.block(input_channels, features, normalize=False),
+            self.block(features, features * 2),
+            self.block(features * 2, features * 4),
+            self.block(features * 4, features * 8),
+            self.block(features * 8, features * 8),
+            self.block(features * 8, features * 8),
+            self.block(features * 8, features * 8),
+        )
+        self.decoder = nn.Sequential(
+            self.block(features * 8, features * 8, upsample=True),
+            self.block(features * 8 * 2, features * 8, upsample=True),
+            self.block(features * 8 * 2, features * 8, upsample=True),
+            self.block(features * 8 * 2, features * 8, upsample=True),
+            self.block(features * 8 * 2, features * 4, upsample=True),
+            self.block(features * 4 * 2, features * 2, upsample=True),
+            self.block(features * 2 * 2, features, upsample=True),
+            nn.ConvTranspose2d(features * 2, output_channels, kernel_size=4, stride=2, padding=1),
+            nn.Tanh(),
+        )
+
+    def block(self, in_channels, out_channels, normalize=True, upsample=False):
+        layers = []
+        if upsample:
+            layers.append(nn.ConvTranspose2d(in_channels, out_channels, 4, 2, 1))
+        else:
+            layers.append(nn.Conv2d(in_channels, out_channels, 4, 2, 1))
+        if normalize:
+            layers.append(nn.BatchNorm2d(out_channels))
+        layers.append(nn.LeakyReLU(0.2) if not upsample else nn.ReLU())
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        encodings = []
+        for layer in self.encoder:
+            x = layer(x)
+            encodings.append(x)
+        for i, layer in enumerate(self.decoder):
+            if i > 0:
+                x = torch.cat([x, encodings[-i]], dim=1)
+            x = layer(x)
+        return x
+
+class Discriminator(nn.Module):
+    def __init__(self, input_channels=3, features=64):
+        super(Discriminator, self).__init__()
+        self.model = nn.Sequential(
+            self.block(input_channels * 2, features, normalize=False),
+            self.block(features, features * 2),
+            self.block(features * 2, features * 4),
+            self.block(features * 4, features * 8, stride=1),
+            nn.Conv2d(features * 8, 1, kernel_size=4, stride=1, padding=1)
+        )
+
+    def block(self, in_channels, out_channels, normalize=True, stride=2):
+        layers = [nn.Conv2d(in_channels, out_channels, kernel_size=4, stride=stride, padding=1)]
+        if normalize:
+            layers.append(nn.BatchNorm2d(out_channels))
+        layers.append(nn.LeakyReLU(0.2))
+        return nn.Sequential(*layers)
+
+    def forward(self, x, y):
+        x = torch.cat([x, y], dim=1)
+        return self.model(x)
+
+def train(generator, discriminator, dataloader, num_epochs=100, lr=2e-4, lambda_l1=100):
+    criterion_GAN = nn.BCEWithLogitsLoss()
+    criterion_L1 = nn.L1Loss()
+    optimizer_G = optim.Adam(generator.parameters(), lr=lr, betas=(0.5, 0.999))
+    optimizer_D = optim.Adam(discriminator.parameters(), lr=lr, betas=(0.5, 0.999))
+
+    for epoch in range(num_epochs):
+        for i, (input_image, target_image) in enumerate(dataloader):
+            input_image, target_image = input_image.cuda(), target_image.cuda()
+            valid = torch.ones((input_image.size(0), 1, 30, 30)).cuda()
+            fake = torch.zeros((input_image.size(0), 1, 30, 30)).cuda()
+            
+            fake_image = generator(input_image)
+            pred_fake = discriminator(fake_image, input_image)
+            loss_GAN = criterion_GAN(pred_fake, valid)
+            loss_L1 = criterion_L1(fake_image, target_image) * lambda_l1
+            loss_G = loss_GAN + loss_L1
+            optimizer_G.zero_grad()
+            loss_G.backward()
+            optimizer_G.step()
+
+            pred_real = discriminator(target_image, input_image)
+            loss_real = criterion_GAN(pred_real, valid)
+            pred_fake = discriminator(fake_image.detach(), input_image)
+            loss_fake = criterion_GAN(pred_fake, fake)
+            loss_D = (loss_real + loss_fake) / 2
+            optimizer_D.zero_grad()
+            loss_D.backward()
+            optimizer_D.step()
+
+            if i % 10 == 0:
+                print(f"Epoch [{epoch}/{num_epochs}] Batch {i}/{len(dataloader)} Loss D: {loss_D.item()}, Loss G: {loss_G.item()}")
+        
+        save_image(fake_image, f"output/fake_epoch_{epoch}.png")
+
+transform = transforms.Compose([
+    transforms.Resize((256, 256)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.5], [0.5]),
+])
+
+dataset = datasets.ImageFolder(root="path/to/dataset", transform=transform)
+dataloader = DataLoader(dataset, batch_size=16, shuffle=True)
+
+generator = Generator().cuda()
+discriminator = Discriminator().cuda()
+
+train(generator, discriminator, dataloader)
